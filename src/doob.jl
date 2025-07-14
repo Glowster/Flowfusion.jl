@@ -37,6 +37,36 @@ doob_guide(P::UniformUnmasking, t, Xt::DiscreteState, X1::DiscreteState) = close
 forward_positive_velocities(Xt::DiscreteState, P::UniformDiscrete{T}) where T = (P.μ * T(1/(Xt.K*(1-1/Xt.K)))) .* (1 .- tensor(onehot(Xt)))
 doob_guide(P::UniformDiscrete, t, Xt::DiscreteState, X1::DiscreteState) = closed_form_doob(P, t, Xt, X1)
 
+#Important: I am assuming Xt is onehotbatch
+function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
+    (; tree, π) = P
+    N = length(π)
+    Q = zeros(Float64, size(Xt.state))
+    all_nodes = PiNode[]
+    ForwardBackward.get_all_nodes!(tree, all_nodes)
+    batch_indices = onecold(Xt.state)
+    # display(size(Q))
+    # display(size(batch_indices))
+    for node in all_nodes
+        isnothing(node.leaf_indices) && continue
+        idx = node.leaf_indices
+        length(idx) <= 1 && continue
+        u = node.u
+        π_partition_view = view(π, idx)
+        sum_π = sum(π_partition_view)
+        isapprox(sum_π, 0.0) && continue
+        for I in CartesianIndices(batch_indices)
+            for j_global in idx
+                if batch_indices[I] != j_global && batch_indices[I] in idx
+                    Q[j_global, I[1], I[2]] += u * (π[j_global] / sum_π)
+                end
+            end
+        end
+    end
+    return Q
+end
+doob_guide(P::HPiQ, t, Xt::DiscreteState, X1::DiscreteState) = closed_form_doob(P, t, Xt, X1)
+
 Guide(P::DoobMatchingFlow, t, Xt::DiscreteState, X1::DiscreteState) = Flowfusion.Guide(mulexpand(onescale(P, t), doob_guide(P.P, t, Xt, X1)))
 Guide(P::DoobMatchingFlow, t, mXt::Union{MaskedState{<:DiscreteState}, DiscreteState}, mX1::MaskedState{<:DiscreteState}) = Guide(mulexpand(onescale(P, t), doob_guide(P.P, t, mXt, mX1)), mX1.cmask, mX1.lmask)
 

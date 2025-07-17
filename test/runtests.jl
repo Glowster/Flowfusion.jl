@@ -84,4 +84,30 @@ using ForwardBackward
         end
 
     end
+
+    @testset "HPiQ forward_vel test" begin
+        
+        tree = ForwardBackward.create_balanced_tree(100, Float64)
+        N = ForwardBackward.modify_tips!(tree)
+        init_leaf_indices!(tree)
+        π = rand(N)/N
+        p = HPiQ(tree, π)
+        batch_size = 5
+        seq_len = 2
+        x = DiscreteState(N, rand(1:N, seq_len, batch_size))
+
+        Q = ForwardBackward.get_Q(p)
+        result = zeros(N, seq_len, batch_size)
+        for i = 1:seq_len
+            for j = 1:batch_size
+                result[:,i,j] = Q[x.state[i,j], :]
+            end
+        end
+
+        result .*= 1 .- tensor(onehot(x))
+        fv = Flowfusion.forward_positive_velocities(x, p)
+        
+        @test isapprox(result, fv, atol=1e-9)
+
+    end
 end

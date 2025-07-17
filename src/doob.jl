@@ -37,16 +37,16 @@ doob_guide(P::UniformUnmasking, t, Xt::DiscreteState, X1::DiscreteState) = close
 forward_positive_velocities(Xt::DiscreteState, P::UniformDiscrete{T}) where T = (P.μ * T(1/(Xt.K*(1-1/Xt.K)))) .* (1 .- tensor(onehot(Xt)))
 doob_guide(P::UniformDiscrete, t, Xt::DiscreteState, X1::DiscreteState) = closed_form_doob(P, t, Xt, X1)
 
-#Important: I am assuming Xt is onehotbatch
 function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
     (; tree, π) = P
     N = length(π)
+    Xt = onehot(Xt) #I believe this does not modify Xt if it is already onehot
     Q = zeros(Float64, size(Xt.state))
     all_nodes = PiNode[]
     ForwardBackward.get_all_nodes!(tree, all_nodes)
     batch_indices = onecold(Xt.state)
     # display(size(Q))
-    # display(size(batch_indices))
+    # display(size(batch_indices)) 
     for node in all_nodes
         isnothing(node.leaf_indices) && continue
         idx = node.leaf_indices
@@ -65,6 +65,59 @@ function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
     end
     return Q
 end
+
+function improved_forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
+    (; tree, π) = P
+    N = length(π)
+    Xt = onehot(Xt) # Assume this is fast or input is already one-hot
+    Q = zeros(Float64, size(Xt.state))
+    all_nodes = PiNode[]
+    ForwardBackward.get_all_nodes!(tree, all_nodes)
+    batch_indices = onecold(Xt.state)
+    
+    # Get batch dimensions for CartesianIndices
+    batch_dims = size(batch_indices)
+
+    for node in all_nodes
+        isnothing(node.leaf_indices) && continue
+        idx = node.leaf_indices
+        k = length(idx)
+        k <= 1 && continue
+
+        π_partition_view = view(π, idx)
+        sum_π = sum(π_partition_view)
+        isapprox(sum_π, 0.0) && continue
+
+        # --- OPTIMIZATION 1: Pre-calculate updates and create a fast lookup map ---
+        # A Dict provides O(1) average time for `haskey` and lookups.
+        # This maps a global index to its local position (1:k) in the `idx` array.
+        idx_to_local_map = Dict(j_global => i for (i, j_global) in enumerate(idx))
+        
+        # This vector of updates is calculated only once per node.
+        node_updates = (node.u / sum_π) .* π_partition_view
+
+        # --- OPTIMIZATION 2: Vectorize the innermost loop ---
+        for I_tuple in CartesianIndices(batch_dims)
+            # Create a CartesianIndex object. It's more idiomatic to pass the tuple.
+            I = CartesianIndex(I_tuple) 
+            b_idx = batch_indices[I]
+
+            # Use the O(1) hash map lookup instead of an O(k) linear search.
+            local_idx = get(idx_to_local_map, b_idx, 0) # Returns 0 if not found
+            if local_idx > 0
+                # Apply updates to the entire relevant slice of Q at once.
+                # This replaces a loop of size k with a vectorized operation.
+                Q_view = view(Q, idx, I)
+                Q_view .+= node_updates
+
+                # Correct the entry for the state itself (since j_global != batch_indices[I]).
+                Q[b_idx, I] -= node_updates[local_idx]
+            end
+        end
+    end
+    return Q
+end
+
 doob_guide(P::HPiQ, t, Xt::DiscreteState, X1::DiscreteState) = closed_form_doob(P, t, Xt, X1)
 
 Guide(P::DoobMatchingFlow, t, Xt::DiscreteState, X1::DiscreteState) = Flowfusion.Guide(mulexpand(onescale(P, t), doob_guide(P.P, t, Xt, X1)))

@@ -38,20 +38,20 @@ sampleX1(n_samples) = Flowfusion.random_discrete_cat(n_samples)
 sampleX0(n_samples) = rand(25:32, 2, n_samples)
 #P = DoobMatchingFlow(UniformDiscrete(1f0)) #The rate of the inner process controls how noisy the paths are
 tree = PiNode(1.0)
-child1 = PiNode(2.0)
-child2 = PiNode(2.0)
-add_child!(tree, child1)
-add_child!(tree, child2)
-for i=1:16
-    add_child!(child1, PiLeaf(i))
-end
-for i=17:33
-    add_child!(child2, PiLeaf(i))
-end
-
-# for i=1:33
-#     add_child!(tree, PiLeaf(i))
+# child1 = PiNode(2.0)
+# child2 = PiNode(2.0)
+# add_child!(tree, child1)
+# add_child!(tree, child2)
+# for i=1:16
+#     add_child!(child1, PiLeaf(i))
 # end
+# for i=17:33
+#     add_child!(child2, PiLeaf(i))
+# end
+
+for i=1:33
+    add_child!(tree, PiLeaf(i))
+end
 init_leaf_indices!(tree)
 
 π = ones(33)/33

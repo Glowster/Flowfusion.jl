@@ -70,7 +70,8 @@ function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
     (; tree, π) = P
     N = length(π)
     Xt = onehot(Xt)
-    Q = zeros(Float64, size(Xt.state)) # fix type
+    #Q = zeros(Float64, size(Xt.state)) # fix type
+    Q = fill!(similar(π, T, size(Xt.state)...), 0)
     all_nodes = PiNode[]
     ForwardBackward.get_all_nodes!(tree, all_nodes)
     batch_indices = onecold(Xt.state)
@@ -103,11 +104,77 @@ function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
                 # This replaces a loop of size k with a vectorized operation.
                 Q_view = view(Q, idx, I)
                 Q_view .+= node_updates
-
-                # Correct the entry for the state itself (since j_global != batch_indices[I]).
+                #Q_view .*= 1 .- Xt
+                ## Correct the entry for the state itself (since j_global != batch_indices[I]).
                 Q[b_idx, I] -= node_updates[local_idx]
             end
         end
+    end
+    return Q
+end
+
+function forward_positive_velocities_superduperhyperfun(Xt::DiscreteState, P::HPiQ{T}) where T
+    (; tree, π) = P
+    N = length(π)
+    Xt_state = onehot(Xt).state
+
+    Q = fill!(similar(π, T, size(Xt_state)...), 0)
+
+    all_nodes = PiNode[]
+    ForwardBackward.get_all_nodes!(tree, all_nodes)
+
+    batch_indices = onecold(Xt_state)
+
+    for node in all_nodes
+        isnothing(node.leaf_indices) && continue
+        idx = node.leaf_indices
+        k = length(idx)
+        k <= 1 && continue
+
+        π_partition = π[idx]
+        sum_π = sum(π_partition)
+        isapprox(sum_π, zero(T)) && continue
+
+        node_updates = (node.u / sum_π) .* π_partition
+
+        # Create and transfer the reverse map
+        reverse_map = zeros(Int, N)
+        reverse_map[idx] .= 1:k
+        d_reverse_map = similar(π, Int, N)
+        copyto!(d_reverse_map, reverse_map)
+
+        # Create the mask
+        mask = (d_reverse_map[batch_indices]) .> 0
+        !any(mask) && continue
+
+        # Apply the main update
+        Q[idx, mask] .+= node_updates
+
+        # --- Correction Step ---
+
+        # Get row indices (dimension 1)
+        rows_to_correct = batch_indices[mask]
+        
+        # `findall` on the N-1 dimensional mask gives CartesianIndex{N-1}
+        batch_cartesian_indices = findall(mask)
+
+        # Extract column indices (dimension 2)
+        cols_to_correct = map(ci -> ci[1], batch_cartesian_indices)
+        # Extract slice indices (dimension 3)
+        slices_to_correct = map(ci -> ci[2], batch_cartesian_indices)
+
+        # --- THE FIX: Use the correct 3D formula for linear indexing ---
+        D1, D2 = size(Q, 1), size(Q, 2)
+        linear_indices_for_correction = (slices_to_correct .- 1) .* D1 .* D2 .+ 
+                                        (cols_to_correct .- 1) .* D1 .+ 
+                                        rows_to_correct
+
+        # Get values to subtract
+        local_indices_for_correction = d_reverse_map[rows_to_correct]
+        values_to_subtract = node_updates[local_indices_for_correction]
+        
+        # Apply corrections
+        Q[linear_indices_for_correction] .-= values_to_subtract
     end
     return Q
 end
@@ -116,7 +183,8 @@ function forward_positive_velocities_par(Xt::DiscreteState, P::HPiQ{T}) where T
     (; tree, π) = P
     N = length(π)
     Xt = onehot(Xt)
-    Q = zeros(Float64, size(Xt.state)) # fix type
+    Q = fill!(similar(π, T, size(Xt.state)...), 0)
+    #Q = zeros(Float64, size(Xt.state)) # fix type
     all_nodes = PiNode[]
     ForwardBackward.get_all_nodes!(tree, all_nodes)
     batch_indices = onecold(Xt.state)
@@ -137,18 +205,23 @@ function forward_positive_velocities_par(Xt::DiscreteState, P::HPiQ{T}) where T
         sum_π = sum(π_partition_view)
         isapprox(sum_π, 0.0) && continue
 
-        idx_to_local_map = Dict(j_global => i for (i, j_global) in enumerate(idx))
+
+
         node_updates = (node.u / sum_π) .* π_partition_view
         # --- This part is the same as before ---
         # Create a mask of 1s and 0s
 
-        mask = haskey.(Ref(idx_to_local_map), batch_indices) #fix this line
+        potential_indices = searchsortedfirst.(Ref(idx), batch_indices)
+        mask = (potential_indices .<= length(idx)) .& (idx[potential_indices] .== batch_indices)
+        local_indices = ifelse.(mask, potential_indices, 1)
 
+        # idx_to_local_map = Dict(j_global => i for (i, j_global) in enumerate(idx))
+        # mask = haskey.(Ref(idx_to_local_map), batch_indices) #fix this line
+        # local_indices = get.(Ref(idx_to_local_map), batch_indices, 1)
 
         # Vectorized update for all nodes except the state itself
         Q[idx, CartesianIndices(batch_dims)] .+= expand_to_data_dims(node_updates) .* expand_to_state_dim(mask)
-        local_indices = get.(Ref(idx_to_local_map), batch_indices, 1)
-
+       
         # 2. Calculate the specific correction value for each batch element
         # println(typeof(local_indices))
         # println(local_indices)
@@ -174,6 +247,77 @@ function forward_positive_velocities_par(Xt::DiscreteState, P::HPiQ{T}) where T
     end
     return Q
 
+end
+
+function forward_positive_velocities_ok(Xt::DiscreteState, P::HPiQ{T}) where T
+    tree = P.tree
+    π = P.π
+    
+    Xt = onehot(Xt)
+    # --- Initial Shape Debugging ---
+    # println("--- Debugging Shapes ---")
+    # println("Shape of input Xt.state: ", size(Xt.state))
+    
+
+    Q = fill!(similar(π, T, size(Xt.state)...), 0)
+    # println("Shape of output matrix Q after initialization: ", size(Q))
+
+    all_nodes = PiNode[]
+    ForwardBackward.get_all_nodes!(tree, all_nodes)
+    
+    batch_indices = onecold(Xt.state) 
+    batch_dims = size(batch_indices)
+    # println("Shape of batch_indices (and batch_dims): ", batch_dims)
+    # println("------------------------\n")
+    
+    debug_prints_done = false
+
+    for node in all_nodes
+        isnothing(node.leaf_indices) && continue
+        idx = node.leaf_indices
+        k = length(idx)
+        k <= 1 && continue
+
+        π_partition_view = view(π, idx)
+        sum_π = sum(π_partition_view)
+        isapprox(sum_π, 0.0) && continue
+
+        node_updates = (node.u / sum_π) .* π_partition_view
+        
+        potential_indices = searchsortedfirst.(Ref(idx), batch_indices)
+        
+        mask_in_bounds = (potential_indices .<= k)
+        safe_indices = ifelse.(mask_in_bounds, potential_indices, 1)
+        found_values = view(idx, safe_indices)
+        mask = mask_in_bounds .& (found_values .== batch_indices)
+
+        #mask = (potential_indices .<= k) .& (view(idx, potential_indices) .== batch_indices)
+        local_indices = ifelse.(mask, potential_indices, 1)
+
+        Q_view_pos = view(Q, idx, CartesianIndices(batch_dims))
+        
+        update_term = reshape(node_updates, (k, ntuple(_->1, length(batch_dims))...)) .* reshape(mask, (1, batch_dims...))
+        Q_view_pos .+= update_term
+       
+        correction_values = view(node_updates, local_indices)
+        
+        correction_matrix = (reshape(idx, (k, ntuple(_->1, length(batch_dims))...)) .== reshape(batch_indices, (1, batch_dims...))) .* reshape(correction_values, (1, batch_dims...))
+        Q_view_pos .-= correction_matrix
+
+        # --- Inner Loop Debugging (runs only once) ---
+        # if !debug_prints_done
+        #     println("--- Debugging Inside First Loop Iteration ---")
+        #     println("Partition size `k`: ", k)
+        #     println("Shape of `mask`: ", size(mask))
+        #     println("Shape of `Q_view_pos`: ", size(Q_view_pos))
+        #     println("Shape of `update_term`: ", size(update_term))
+        #     println("Shape of `correction_matrix`: ", size(correction_matrix))
+        #     println("-----------------------------------------\n")
+        #     debug_prints_done = true
+        # end
+    end
+    
+    return Q
 end
 
 function forward_positive_velocities_par2(Xt::DiscreteState, P::HPiQ{T}) where T
@@ -284,6 +428,56 @@ function forward_positive_velocities_par3(Xt::DiscreteState, P::HPiQ{T}) where T
     end
     return Q
 end
+function forward_positive_velocities_par4(Xt::DiscreteState, P::HPiQ{T}) where T
+    (; tree, π) = P
+    N = length(π)
+    Xt = onehot(Xt)
+    Q = zeros(Float64, size(Xt.state))  # Ideally, this should be a GPU array if Xt.state is.
+    all_nodes = PiNode[]
+    ForwardBackward.get_all_nodes!(tree, all_nodes)
+    batch_indices = onecold(Xt.state)
+    batch_dims = size(batch_indices)
+
+    # GPU-compatible helper functions
+    expand_to_data_dims(v) = reshape(v, (length(v), ntuple(_ -> 1, length(batch_dims))...))
+    expand_to_state_dim(a) = reshape(a, (1, size(a)...))
+
+    for node in all_nodes
+        isnothing(node.leaf_indices) && continue
+        idx = node.leaf_indices # Assuming idx is already on the correct device (GPU)
+        k = length(idx)
+        k <= 1 && continue
+
+        π_partition_view = view(π, idx)
+        sum_π = sum(π_partition_view)
+        isapprox(sum_π, 0.0) && continue
+
+        # 1. Create a mask for batch elements belonging to the current partition
+        # This can be slow if done iteratively. A broadcasted approach is better if possible.
+        mask = any(Fix2(==, batch_indices), idx)
+
+        # Ensure the mask can be broadcasted correctly
+        broadcast_mask = expand_to_state_dim(mask)
+
+        # 2. Calculate the update rates for each state in the partition
+        node_updates = (node.u / sum_π) .* π_partition_view
+        
+        # 3. Create a view into the relevant rows of Q
+        Q_gathered = view(Q, idx, :, :)
+
+        # 4. Perform the update using the (Sum of All) - (Self) pattern
+        
+        # Add the sum of all updates to every state in the partition
+        total_update = sum(node_updates)
+        Q_gathered .+= total_update .* broadcast_mask
+        
+        # Subtract the individual ("self") update from each corresponding state
+        individual_updates = expand_to_data_dims(node_updates)
+        Q_gathered .-= individual_updates .* broadcast_mask
+    end
+    return Q
+end
+
 
 doob_guide(P::HPiQ, t, Xt::DiscreteState, X1::DiscreteState) = closed_form_doob(P, t, Xt, X1)
 

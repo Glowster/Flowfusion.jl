@@ -96,7 +96,7 @@ using ForwardBackward
         seq_len = 2
         x = DiscreteState(N, rand(1:N, seq_len, batch_size))
 
-        Q = ForwardBackward.get_Q(p)
+        Q = ForwardBackward.HPiQ_Qmatrix(p)
         result = zeros(N, seq_len, batch_size)
         for i = 1:seq_len
             for j = 1:batch_size
@@ -105,7 +105,7 @@ using ForwardBackward
         end
 
         result .*= 1 .- tensor(onehot(x))
-        fv = Flowfusion.forward_positive_velocities(x, p)
+        fv = Flowfusion.forward_positive_velocities_ok(x, p)
         
         @test isapprox(result, fv, atol=1e-9)
 

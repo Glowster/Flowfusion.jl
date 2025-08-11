@@ -91,21 +91,12 @@ function forward_positive_velocities(Xt::DiscreteState, P::HPiQ{T}) where T
         idx_to_local_map = Dict(j_global => i for (i, j_global) in enumerate(idx))
         node_updates = (node.u / sum_π) .* π_partition_view
 
-
-        #for I_tuple in CartesianIndices(batch_dims)
-
-            # I = CartesianIndex(I_tuple) 
-            # b_idx = batch_indices[I]
         for (I, b_idx) in pairs(batch_indices)
 
             local_idx = get(idx_to_local_map, b_idx, 0) # Returns 0 if not found
             if local_idx > 0
-                # Apply updates to the entire relevant slice of Q at once.
-                # This replaces a loop of size k with a vectorized operation.
                 Q_view = view(Q, idx, I)
                 Q_view .+= node_updates
-                #Q_view .*= 1 .- Xt
-                ## Correct the entry for the state itself (since j_global != batch_indices[I]).
                 Q[b_idx, I] -= node_updates[local_idx]
             end
         end

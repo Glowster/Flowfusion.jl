@@ -113,7 +113,7 @@ UniformDiscretePoissonIndelProcess(λ::T, μ::T, α::T, k::Int) where {T} =
     UniformDiscretePoissonIndelProcess{T}(λ, μ, α, k, NNlib.softplus)
 
 
-prefix(S::DiscreteState, k::Int; suffix = Int[]) = DiscreteState(max(S.K,k), vcat(k, S.state, suffix))
+prefix(S::DiscreteState, k::Int) = DiscreteState(max(S.K,k), vcat(k, S.state))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -931,6 +931,110 @@ function doob_ud_full_tensors_fast(p::UniformDiscretePoissonIndelProcess{T}, Xt:
 end
 
 
+function doob_ud_full_tensors_aligned(p::UniformDiscretePoissonIndelProcess{T},
+                                      Xt::Vector{Int}, x1::Vector{Int}, t::T,
+                                      events::Vector{Event}) where {T}
+    # Right-branch constants at time t
+    C = make_precomp(p, t)
+    s2    = C.s2
+    Pdiag = C.P2_diag
+    Poff  = C.P2_off
+    K     = p.k
+    n     = length(Xt)
+    m     = length(x1)
+
+    # instantaneous rates
+    q_off = p.α / K        # off-diagonal substitution per token
+    q_ins = p.λ / K        # per-token insertion rate
+
+    # ── Decode alignment into obligations (match/delete per site, B-queues per gap)
+    tag        = Vector{Symbol}(undef, n)   # :match or :delete
+    match_tok  = zeros(Int, n)              # valid iff :match
+    gap_queues = [Int[] for _ in 1:(n+1)]   # store LEAF TOKENS per gap (0..n)
+
+    ic = 0; jc = 0; gap = 0
+    for ev in events
+        if ev.typ === :R
+            ic += 1; jc += 1
+            tag[ic] = :match
+            match_tok[ic] = x1[jc]
+            gap = ic
+        elseif ev.typ === :A
+            ic += 1
+            tag[ic] = :delete
+            gap = ic
+        elseif ev.typ === :B
+            jc += 1
+            # push LEAF TOKEN (x1[jc]) into this gap’s queue
+            Base.push!(gap_queues[gap + 1], x1[jc])
+        else
+            error("Unknown event typ=$(ev.typ)")
+        end
+    end
+    @assert ic == n "alignment does not consume all Xt positions (got $ic, need $n)"
+    @assert jc == m "alignment does not consume all x1 positions (got $jc, need $m)"
+
+    # ── Allocate hazards
+    sub = zeros(T, K, n)
+    del = zeros(T, n)
+    ins = zeros(T, K, n+1)
+
+    # ── Per-site hazards
+    @inbounds for i in 1:n
+        a = Xt[i]
+        if tag[i] === :match
+            b = match_tok[i]
+            denom = (a == b) ? Pdiag : Poff
+            for c in 1:K
+                if c != a
+                    num = (c == b) ? Pdiag : Poff
+                    sub[c, i] = q_off * (num / denom)
+                end
+            end
+            del[i] = zero(T)                    # cannot delete a must-match site
+        else
+            # must-delete: substitutions are neutral wrt h ⇒ plain q_off
+            for c in 1:K
+                if c != a
+                    sub[c, i] = q_off
+                end
+            end
+            # strict Doob deletion scaling μ/(1 - s2)
+            del[i] = p.μ / max(eps(T), (one(T) - s2))
+        end
+    end
+
+    # ── Per-gap insertions (FIXED: include (L+1) transient multiplicity)
+    # base (transient) = q_ins * (1 - s2) * (L + 1)
+    # productive term  = (μ * s2 / (1 - s2)) * Σ_{r in queue} P(c→r)
+    # with Σ P(c→r) = cnt[c]*Pdiag + (L - cnt[c])*Poff
+    @inbounds for s in 0:n
+        q = gap_queues[s+1]     # Vector{Int} of leaf TOKENS in this gap
+        L = length(q)
+
+        # delete-before-leaf in any of (L+1) slots along the fixed path
+        base = q_ins * (one(T) - s2) * (L + 1)
+
+        if L == 0
+            for c in 1:K
+                ins[c, s+1] = base
+            end
+        else
+            cnt = zeros(Int, K)
+            for r in q
+                cnt[r] += 1
+            end
+            factor = p.μ * s2 / max(eps(T), (one(T) - s2))
+            for c in 1:K
+                sumP = cnt[c] * Pdiag + (L - cnt[c]) * Poff
+                ins[c, s+1] = base + factor * sumP
+            end
+        end
+    end
+
+    return (sub = sub, del = del, ins = ins)
+end
+
 
 
 
@@ -969,7 +1073,73 @@ function floss(P::fbu(UniformDiscretePoissonIndelProcess), Xt::MaskedState{<:Dis
   return loss
 end
 
+#=
+_like(like, ::Type{T}, dims...) where {T} = similar(like, T, dims...)
 
+function _pos_breg(p::AbstractArray{T}, q::AbstractArray{T}; eps = T(1e-8)) where {T}
+  # Elementwise D(p || q) for Poisson-like positive Bregman:
+  # p * (log p - log q) - p + q
+  return p .* (log.(p .+ eps) .- log.(q .+ eps)) .- p .+ q
+end
+
+"""
+Xt must be a MaskedState with the prefix token.
+This version mirrors one-hot and masks to the same device as `sub_rates` (so CPU/GPU works transparently).
+"""
+function floss(P::fbu(UniformDiscretePoissonIndelProcess),
+               Xt::MaskedState{<:DiscreteState},
+               X̂₁, G::Guide, c)
+
+  # Predicted rates (they may already be on CPU or GPU depending on caller)
+  sub_rates = P.transform(X̂₁.sub)
+  del_rates = P.transform(X̂₁.del)
+  ins_rates = P.transform(X̂₁.ins)
+
+  # Mirror Guide payload (target rates) to the same device as `sub_rates`
+  H = G.H
+  Hsub = (eltype(H.sub) === eltype(sub_rates)) && (typeof(H.sub) === typeof(sub_rates)) ?
+         H.sub : (_tmp = _like(sub_rates, eltype(H.sub), size(H.sub)...); copyto!(_tmp, H.sub); _tmp)
+  Hdel = (eltype(H.del) === eltype(del_rates)) && (typeof(H.del) === typeof(del_rates)) ?
+         H.del : (_tmp = _like(del_rates, eltype(H.del), size(H.del)...); copyto!(_tmp, H.del); _tmp)
+  Hins = (eltype(H.ins) === eltype(ins_rates)) && (typeof(H.ins) === typeof(ins_rates)) ?
+         H.ins : (_tmp = _like(ins_rates, eltype(H.ins), size(H.ins)...); copyto!(_tmp, H.ins); _tmp)
+
+  # Build self-substitution one-hot from Xt (always CPU ints), then mirror to device of sub_rates
+  K = P.k
+  xt_tokens = clamp.(tensor(Xt)[2:end, :], 1, K)  # drop prefix, ensure 1..K
+  oh_host = tensor(onehotbatch(xt_tokens, 1:K))   # CPU dense
+  oh_dev  = (typeof(oh_host) === typeof(sub_rates)) && (eltype(oh_host) === eltype(sub_rates)) ?
+            oh_host : (_tmp = _like(sub_rates, eltype(oh_host), size(oh_host)...); copyto!(_tmp, oh_host); _tmp)
+
+  # Zero self-substitutions
+  sub_rates = sub_rates .* (1 .- oh_dev)
+
+  # Mirror masks to device (as Bool)
+  lmaskG_host = getlmask(G)
+  lmaskX_host = getlmask(Xt)
+  lmaskG_dev  = (typeof(lmaskG_host) === typeof(sub_rates)) && (eltype(lmaskG_host) === eltype(sub_rates)) ?
+                 lmaskG_host :
+                 (_tmp = _like(sub_rates, Bool, size(lmaskG_host)...); copyto!(_tmp, lmaskG_host); _tmp)
+  lmaskX_dev  = (typeof(lmaskX_host) === typeof(sub_rates)) && (eltype(lmaskX_host) === eltype(sub_rates)) ?
+                 lmaskX_host :
+                 (_tmp = _like(sub_rates, Bool, size(lmaskX_host)...); copyto!(_tmp, lmaskX_host); _tmp)
+
+  # Mirror c to device if it’s an array
+  c_dev = c
+  if c isa AbstractArray
+      c_dev = (typeof(c) === typeof(sub_rates)) && (eltype(c) === eltype(sub_rates)) ?
+              c : (_tmp = _like(sub_rates, eltype(c), size(c)...); copyto!(_tmp, c); _tmp)
+  end
+
+  # Positive Bregman D(tgt || pred) with masks on the same device as the data
+  loss = scaledmaskedmean(_pos_breg(Hsub, sub_rates), c_dev, lmaskG_dev) +
+         scaledmaskedmean(_pos_breg(Hdel, del_rates), c_dev, lmaskG_dev) +
+         scaledmaskedmean(_pos_breg(Hins, ins_rates), c_dev, lmaskX_dev)  # Use Xt mask for insertions
+
+  return loss
+end
+
+=#
 # ─────────────────────────────────────────────────────────────────────────────
 # Fused front-end: sample + grouped Doob
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1156,6 +1326,61 @@ function Guide(P::UniformDiscretePoissonIndelProcess{T},
 end
 
 
+function GuideAligned(P::UniformDiscretePoissonIndelProcess{T}, t::Real,
+                      Xt::DiscreteState{<:AbstractArray{<:Signed}},
+                      X1::DiscreteState{<:AbstractArray{<:Signed}};
+                      rng::AbstractRNG = Random.default_rng()) where {T}
+
+    C = make_precomp(P, T(t))
+    B = make_branch_ud(P, C)
+    Xt_vec = collect(tensor(Xt))
+    x1_vec = collect(tensor(X1))
+
+    events, _ = sample_alignment_branch_ud(rng, Xt_vec, x1_vec, B)
+    rates = doob_ud_full_tensors_aligned(P, Xt_vec, x1_vec, T(t), events)
+    return Flowfusion.Guide((sub = rates.sub, del = rates.del, ins = rates.ins))
+end
+
+
+function GuideAligned(P::UniformDiscretePoissonIndelProcess{T},
+                      tvec::AbstractVector{<:Real},
+                      Xts::Vector{<:DiscreteState{<:AbstractArray{<:Signed}}},
+                      X1s::Vector{<:DiscreteState{<:AbstractArray{<:Signed}}};
+                      rng::AbstractRNG = Random.default_rng()) where {T}
+
+    Bsz = length(Xts)
+    @assert Bsz == length(X1s) == length(tvec)
+    lens  = length.(tensor.(Xts))
+    nmax  = maximum(lens)
+    K     = P.k
+    S     = eltype(tvec)
+
+    sub    = zeros(S, K, nmax, Bsz)
+    del    = zeros(S, 1, nmax, Bsz)
+    ins    = zeros(S, K, nmax + 1, Bsz)
+    lmask  = falses(nmax, Bsz)
+    gapmask= falses(nmax + 1, Bsz)
+
+    for b in 1:Bsz
+        t = T(tvec[b])
+        Xt = Xts[b]; X1 = X1s[b]
+        C  = make_precomp(P, t)
+        B  = make_branch_ud(P, C)
+        Xt_vec = collect(tensor(Xt))
+        x1_vec = collect(tensor(X1))
+        events, _ = sample_alignment_branch_ud(rng, Xt_vec, x1_vec, B)
+        rates = doob_ud_full_tensors_aligned(P, Xt_vec, x1_vec, t, events)
+        n = length(Xt_vec)
+        sub[:, 1:n, b]     .= S.(rates.sub)
+        del[1, 1:n, b]     .= S.(rates.del)
+        ins[:, 1:(n+1), b] .= S.(rates.ins)
+        lmask[1:n, b]      .= true
+        gapmask[1:n+1, b]  .= true
+    end
+
+    return Flowfusion.Guide((sub = sub, del = del, ins = ins), gapmask, lmask)
+end
+
 """
     step(P::UniformDiscretePoissonIndelProcess, Xt, guide::Guide, s1, s2)
 
@@ -1262,485 +1487,252 @@ function step(P::UniformDiscretePoissonIndelProcess,
     return DiscreteState(Xt.K, result)
 end
 
-
-
-
-
-
-
-#=
-#Stand-alone for sampling Doob h rates conditioned on a single sampled alignment, including monte-carlo validation that 
-
 """
-    UDParams(λ, μ, α, k)
+    sample_alignment_branch_ud(rng, Xt, x1, B) -> (events::Vector{Event}, h)
 
-Uniform-Discrete Poisson–Indel Process parameters:
-- λ: insertion rate
-- μ: deletion rate
-- α: substitution rate parameter (off-diagonal instantaneous rate α/k)
-- k: alphabet size (tokens are Ints 1…k)
+Sample a right-branch alignment path between Xt (root at t) and x1 (leaf at 1)
+using BranchUD transitions. Returns events and total mass h.
 """
-struct UDParams{T}
-    λ::T
-    μ::T
-    α::T
-    k::Int
-end
-
-"""
-    BranchConst(p, t)
-
-Right-branch (length s=1-t) constants.
-Fields:
-- s::T          # branch length
-- s2::T         # survival e^{-μ s}
-- Pdiag::T      # substitution kernel diagonal over s
-- Poff::T       # substitution kernel off-diagonal over s
-- Iins::T       # per-token insertion mass over s: λ*((1 - s2)/μ)/k
-- q_off::T      # instantaneous off-diagonal sub rate α/k
-- q_ins::T      # instantaneous per-token insertion rate λ/k
-"""
-struct BranchConst{T}
-    s::T; s2::T
-    Pdiag::T; Poff::T
-    Iins::T
-    q_off::T
-    q_ins::T
-end
-
-pow_sub(α,t) = exp(-α*t)
-survival(μ,t) = exp(-μ*t)
-
-function branchconst(p::UDParams{T}, t::T) where {T}
-    s  = one(T) - t
-    s2 = survival(p.μ, s)
-    pow = pow_sub(p.α, s)
-    Pdiag = pow + (1 - pow)/p.k
-    Poff  = (1 - pow)/p.k
-    Iins  = p.λ * ((1 - s2)/p.μ) / p.k
-    BranchConst{T}(s, s2, Pdiag, Poff, Iins, p.α/p.k, p.λ/p.k)
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Utilities
-# ─────────────────────────────────────────────────────────────────────────────
-
-@inline function logaddexp(a::T, b::T) where {T}
-    if a == -Inf; return b; end
-    if b == -Inf; return a; end
-    if b > a; a, b = b, a; end
-    return a + log1p(exp(b - a))
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Single-branch DP: log-space forward/backward, plus alignment sampling
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    dp_logs_single!(logF, logB, Xt, x1, B)
-
-Compute log-space forward (logF) and backward (logB) DPs for P(x1 | Xt) on right branch.
-Returns logh = log P(x1 | Xt).
-"""
-function dp_logs_single!(logF::AbstractMatrix{T}, logB::AbstractMatrix{T},
-                         Xt::Vector{Int}, x1::Vector{Int},
-                         B::BranchConst{T}) where {T}
+function sample_alignment_branch_ud(rng::AbstractRNG,
+                                    Xt::Vector{Int},
+                                    x1::Vector{Int},
+                                    B::BranchUD{T}) where {T}
     n, m = length(Xt), length(x1)
-    # forward
-    fill!(logF, -Inf); logF[1,1] = zero(T)
-    log_del = log1p(-B.s2)
-    log_ins = log(B.q_ins) + log1p(-B.s2) - log(B.q_ins * B.s * 0 + 1) # not used; prefer direct Iins below
-    # NOTE: we use Iins directly (finite-horizon mass); so set:
-    log_Iins = log(B.Iins)
-    log_s2   = log(B.s2)
+    F = zeros(T, n+1, m+1); F[1,1] = one(T)
+
+    # forward DP
     for i in 0:n, j in 0:m
-        f = logF[i+1, j+1]; f == -Inf && continue
+        f = F[i+1, j+1]
         if i < n
-            logF[i+2, j+1] = logaddexp(logF[i+2, j+1], f + log_del)
+            F[i+2, j+1] += f * (one(T) - B.surv)               # :A
         end
         if j < m
-            logF[i+1, j+2] = logaddexp(logF[i+1, j+2], f + log_Iins)
+            F[i+1, j+2] += f * B.Iins                          # :B
         end
         if i < n && j < m
-            P = (Xt[i+1] == x1[j+1]) ? B.Pdiag : B.Poff
-            logF[i+2, j+2] = logaddexp(logF[i+2, j+2], f + log_s2 + log(P))
+            P = (Xt[i+1] == x1[j+1]) ? B.Pdiag : B.Poff        # :R
+            F[i+2, j+2] += f * B.surv * P
         end
     end
-    logh = logF[n+1, m+1]
+    h = F[n+1, m+1]
 
-    # backward
-    fill!(logB, -Inf); logB[n+1, m+1] = zero(T)
-    for i in n:-1:0, j in m:-1:0
-        (i == n && j == m) && continue
-        acc = -Inf
-        if i < n
-            acc = logaddexp(acc, log_del + logB[i+2, j+1])
-        end
-        if j < m
-            acc = logaddexp(acc, log_Iins + logB[i+1, j+2])
-        end
-        if i < n && j < m
-            P = (Xt[i+1] == x1[j+1]) ? B.Pdiag : B.Poff
-            acc = logaddexp(acc, log_s2 + log(P) + logB[i+2, j+2])
-        end
-        logB[i+1, j+1] = acc
-    end
-    return logh
-end
+    # backward sample
+    events = Vector{Event}()
+    i, j = n, m
+    while i>0 || j>0
+        wA = (i>0)        ? F[i,   j+1] * (one(T) - B.surv) : zero(T)
+        wB = (j>0)        ? F[i+1, j  ] * B.Iins            : zero(T)
+        wR = (i>0 && j>0) ? F[i,   j  ] * B.surv * ((Xt[i]==x1[j]) ? B.Pdiag : B.Poff) : zero(T)
+        wT = wA + wB + wR
 
-
-"""
-    AlignmentObligations
-
-Tags implied by a fixed alignment A*:
-- tag[i] ∈ (:match, :delete)
-- match_tok[i] valid iff tag[i]==:match
-- gap_queues[s+1] is a Vector{Int} of pending surviving insertions in gap s (0…n), in order.
-"""
-
-struct AlignmentObligations
-    tag::Vector{Symbol}
-    match_tok::Vector{Int}
-    gap_queues::Vector{Vector{Int}}
-end
-
-
-"""
-    sample_alignment_and_obligations(rng, Xt, x1, B)
-
-Sample a single-branch alignment path Xt ↔ x1 using log-backward DP, and
-build the corresponding obligations. Returns (obl, logh).
-"""
-function sample_alignment_and_obligations(rng::AbstractRNG,
-                                          Xt::Vector{Int}, x1::Vector{Int},
-                                          B::BranchConst{T}) where {T}
-    n, m = length(Xt), length(x1)
-    logF = fill(-Inf, n+1, m+1)
-    logB = similar(logF)
-    logh = dp_logs_single!(logF, logB, Xt, x1, B)
-
-    tag = Vector{Symbol}(undef, n)
-    match_tok = zeros(Int, n)
-    gaps = [Int[] for _ in 1:(n+1)]
-
-    # forward sampling using logB
-    i = 0; j = 0
-    log_del = log1p(-B.s2)
-    log_Iins = log(B.Iins)
-    log_s2 = log(B.s2)
-
-    while i < n || j < m
-        lD = -Inf; lI = -Inf; lR = -Inf
-        if i < n
-            lD = log_del + logB[i+2, j+1]
-        end
-        if j < m
-            lI = log_Iins + logB[i+1, j+2]
-        end
-        if i < n && j < m
-            P = (Xt[i+1] == x1[j+1]) ? B.Pdiag : B.Poff
-            lR = log_s2 + log(P) + logB[i+2, j+2]
-        end
-        # stabilize
-        lmax = maximum((lD, lI, lR))
-        if lmax == -Inf
-            # numerical safety: choose any valid move deterministically
-            if i < n && j < m
-                # prefer R if possible
-                tag[i+1] = :match; match_tok[i+1] = x1[j+1]; i += 1; j += 1
-            elseif i < n
-                tag[i+1] = :delete; i += 1
+        if !(wT > 0)
+            if i>0 && j>0
+                push!(events, Event(:R, i, j)); i -= 1; j -= 1
+            elseif i>0
+                push!(events, Event(:A, i, 0)); i -= 1
             else
-                push!(gaps[i+1], x1[j+1]); j += 1
+                push!(events, Event(:B, 0, j)); j -= 1
             end
             continue
         end
-        wD = (i < n) ? exp(lD - lmax) : 0.0
-        wI = (j < m) ? exp(lI - lmax) : 0.0
-        wR = (i < n && j < m) ? exp(lR - lmax) : 0.0
-        s = wD + wI + wR
-        u = rand(rng) * s
-        if u < wD
-            tag[i+1] = :delete; i += 1
-        elseif u < wD + wI
-            push!(gaps[i+1], x1[j+1]); j += 1
+        u = rand(rng) * float(wT)
+        if u < wA
+            push!(events, Event(:A, i, 0));  i -= 1
+        elseif u < wA + wB
+            push!(events, Event(:B, 0, j));  j -= 1
         else
-            tag[i+1] = :match; match_tok[i+1] = x1[j+1]; i += 1; j += 1
+            push!(events, Event(:R, i, j));  i -= 1; j -= 1
         end
     end
-
-    return AlignmentObligations(tag, match_tok, gaps), logh
+    reverse!(events)
+    return events, h
 end
 
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Doob h-transform hazards
+# DP-free pseudo-marginal MH for insertions (no DP tables)
 # ─────────────────────────────────────────────────────────────────────────────
 
-"""
-    doob_full_marginal(p, Xt, x1, t)
+# Unbiased IS estimate of h(root -> leaf) on the right branch using locally
+# normalized step weights. Works in log-domain for stability.
+function _h_estimate_is(root::Vector{Int}, leaf::Vector{Int}, B::BranchUD{T};
+                        N::Int=64, rng::AbstractRNG=Random.default_rng()) where {T}
+    n, m = length(root), length(leaf)
+    # log-sum-exp accumulator across N paths
+    maxlog = -Inf
+    acc = zero(T)
 
-Full marginal Doob hazards via inside–outside (log-space).
-Returns NamedTuple (sub::Array{T,2}, del::Vector{T}, ins::Array{T,2}, hcur::T).
-Shapes: sub (K,n), del (n), ins (K,n+1). Self-substitutions are zeroed.
-"""
-function doob_full_marginal(p::UDParams{T}, Xt::Vector{Int}, x1::Vector{Int}, t::T) where {T}
-    B = branchconst(p, t)
-    n, m, K = length(Xt), length(x1), p.k
+    @inbounds for _ in 1:N
+        i = 0; j = 0
+        logW = zero(T)
+        while i < n || j < m
+            wA = (i < n) ? (one(T) - B.surv) : zero(T)
+            wB = (j < m) ?  B.Iins          : zero(T)
+            wR = (i < n && j < m) ?
+                 (B.surv * ((root[i+1] == leaf[j+1]) ? B.Pdiag : B.Poff)) : zero(T)
 
-    # forward/backward
-    logF = fill(-Inf, n+1, m+1)
-    logB = similar(logF)
-    logh = dp_logs_single!(logF, logB, Xt, x1, B)
-
-    # token set in x1 for speed
-    seen = Dict{Int,Int}(); toks = Int[]
-    for b in x1
-        if !haskey(seen, b); seen[b] = length(seen) + 1; push!(toks, b); end
-    end
-    U = length(toks)
-
-    ΔP = B.Pdiag - B.Poff
-    q_off = B.q_off
-    q_ins = B.q_ins
-
-    # Substitutions (K,n)
-    sub = zeros(T, K, n)
-    for i in 1:n
-        # accumulate log-mass over j for matches that consume Xt[i] and x1[j]
-        tmp = fill(-Inf, U)
-        for j in 1:m
-            idx = get(seen, x1[j], 0)
-            if idx != 0
-                val = logF[i, j] + log(B.s2) + logB[i+1, j+1]
-                tmp[idx] = logaddexp(tmp[idx], val)
-            end
-        end
-        # convert to normalized ratios
-        r_tok = fill(zero(T), U)
-        for u in 1:U
-            r_tok[u] = tmp[u] == -Inf ? zero(T) : exp(tmp[u] - logh)
-        end
-        idx_a = get(seen, Xt[i], 0)
-        r_a = (idx_a == 0 || tmp[idx_a] == -Inf) ? zero(T) : exp(tmp[idx_a] - logh)
-
-        base_ratio = max(zero(T), 1 - ΔP * r_a)
-        @inbounds for c in 1:K
-            sub[c, i] = q_off * base_ratio
-        end
-        for (u, tok) in enumerate(toks)
-            ratio = max(zero(T), 1 + ΔP * (r_tok[u] - r_a))
-            sub[tok, i] = q_off * ratio
-        end
-        sub[Xt[i], i] = zero(T) # no self-sub
-    end
-
-    # Deletions (n)
-    del = zeros(T, n)
-    for i in 1:n
-        acc = -Inf
-        for j in 0:m
-            acc = logaddexp(acc, logF[i, j+1] + logB[i+1, j+1])
-        end
-        r = acc == -Inf ? zero(T) : exp(acc - logh)
-        del[i] = p.μ * r
-    end
-
-    # Insertions (K, n+1)
-    D_ratio = zeros(T, n+1)          # deletion-of-insert branch
-    M_ratio = zeros(T, U, n+1)       # token-specific match branch
-    for s in 0:n
-        # deletion-of-insert: sum_j F[s,j] * B[s,j]
-        accD = -Inf
-        for j in 0:m
-            accD = logaddexp(accD, logF[s+1, j+1] + logB[s+1, j+1])
-        end
-        D_ratio[s+1] = accD == -Inf ? zero(T) : exp(accD - logh)
-        # match-of-insert (careful indexing)
-        for j in 1:m
-            idx = get(seen, x1[j], 0)
-            if idx != 0
-                val = logF[s+1, j] + logB[s+1, j+1]
-                M_ratio[idx, s+1] += exp(val - logh)
-            end
-        end
-    end
-    S_ratio = vec(sum(M_ratio; dims=1))  # (n+1,)
-
-    ins = zeros(T, K, n+1)
-    for s in 0:n
-        base_ratio = (1 - B.s2) * D_ratio[s+1] + B.s2 * S_ratio[s+1] * B.Poff
-        base_ratio = max(zero(T), base_ratio)
-        @inbounds for c in 1:K
-            ins[c, s+1] = q_ins * base_ratio
-        end
-        for (u, tok) in enumerate(toks)
-            r_m = M_ratio[u, s+1]
-            val_ratio = (1 - B.s2) * D_ratio[s+1] + B.s2 * (r_m * B.Pdiag + (S_ratio[s+1] - r_m) * B.Poff)
-            ins[tok, s+1] = q_ins * max(zero(T), val_ratio)
-        end
-    end
-
-    return (sub=sub, del=del, ins=ins, hcur=exp(logh))
-end
-
-"""
-    doob_conditional_given_alignment(p, Xt, x1, t, obl)
-
-Alignment-conditioned Doob hazards for a fixed set of obligations.
-Returns (sub::Array{T,2}, del::Vector{T}, ins::Array{T,2}).
-"""
-function doob_conditional_given_alignment(p::UDParams{T},
-                                          Xt::Vector{Int}, x1::Vector{Int},
-                                          t::T, obl::AlignmentObligations) where {T}
-    B = branchconst(p, t)
-    n, K = length(Xt), p.k
-    sub = zeros(T, K, n)
-    del = zeros(T, n)
-    ins = zeros(T, K, n+1)
-
-    # per-site hazards
-    for i in 1:n
-        a = Xt[i]
-        if obl.tag[i] === :match
-            b = obl.match_tok[i]
-            # substitution to c != a: q_off * P(c->b)/P(a->b)
-            denom = (a == b) ? B.Pdiag : B.Poff
-            @inbounds for c in 1:K
-                if c != a
-                    num = (c == b) ? B.Pdiag : B.Poff
-                    sub[c, i] = B.q_off * (num / denom)
+            Z = wA + wB + wR
+            if !(Z > 0)  # underflow fallback: take any valid move, no weight update
+                if i < n && j < m
+                    i += 1; j += 1
+                elseif i < n
+                    i += 1
+                else
+                    j += 1
                 end
+                continue
             end
-            del[i] = zero(T)   # cannot delete a must-match site
-        else
-            # must-delete: substitutions are neutral wrt h, deletions are forced
-            @inbounds for c in 1:K
-                if c != a
-                    sub[c, i] = B.q_off
+
+            u = rand(rng) * float(Z)
+            if u < wA
+                i += 1
+            elseif u < wA + wB
+                j += 1
+            else
+                i += 1; j += 1
+            end
+            logW += log(Z)
+        end
+
+        if logW > maxlog
+            acc *= exp(maxlog - logW)
+            maxlog = logW
+        end
+        acc += one(T)
+    end
+
+    return exp(maxlog) * (acc / T(N))
+end
+
+# Same estimator but with one symbol c inserted at gap s (0..n)
+function _h_insert_estimate_is(root::Vector{Int}, s::Int, c::Int,
+                               leaf::Vector{Int}, B::BranchUD{T};
+                               N::Int=64, rng::AbstractRNG=Random.default_rng()) where {T}
+    n = length(root)
+    root2 = Vector{Int}(undef, n + 1)
+    @inbounds begin
+        for i in 1:s; root2[i] = root[i]; end
+        root2[s+1] = c
+        for i in s+1:n; root2[i+1] = root[i]; end
+    end
+    return _h_estimate_is(root2, leaf, B; N=N, rng=rng)
+end
+
+"""
+    step_mh_pseudomarginal(P, Xt, hat, X1, s1, s2; N_is=64, rng)
+
+Like your `step`, but **DP-free** and with **pseudo-marginal MH** on insertions:
+- Propose insertions from `hat.ins` (aligned guide).
+- Accept each proposed (gap s, token c) with
+      α = min(1, r_true_hat / r_prop),
+  where  r_true_hat = (λ/K) * ĥ_after / ĥ_before
+  and ĥ_* are unbiased IS estimates from `_h_estimate_is` (no DP).
+
+Substitutions and deletions use `hat.sub`/`hat.del` as in your `step`.
+"""
+function step_mh_pseudomarginal(P::UniformDiscretePoissonIndelProcess,
+                                Xt::DiscreteState{<:AbstractArray{<:Signed}},
+                                hat,
+                                X1::DiscreteState{<:AbstractArray{<:Signed}},
+                                s1::Real, s2::Real;
+                                N_is::Int=64,
+                                rng::AbstractRNG=Random.default_rng())
+
+    @assert ndims(Xt.state) == 1 "UniformDiscretePoissonIndelProcess.step_mh_pseudomarginal only supports 1D DiscreteState"
+
+    # Transform hazards and zero self-substitutions (same as your `step`)
+    sub = Array(P.transform(hat.sub)[:, :, 1])             # (K, n)
+    del = vec(Array(P.transform(hat.del))[1, :, 1])        # (n,)
+    ins = Array(P.transform(hat.ins)[:, :, 1])             # (K, n+1)
+
+    x      = collect(tensor(Xt))
+    x1_vec = collect(tensor(X1))
+    K, n   = size(sub, 1), size(sub, 2)
+
+    if n > 0
+        current_mask = tensor(onehot(Xt))[:,:,1]
+        sub .= sub .* (1 .- current_mask)  # forbid self-subs
+    end
+    @assert length(del) == n
+    @assert size(ins, 1) == K && size(ins, 2) == n + 1
+
+    dt = float(s2 - s1)
+
+    # ── Site events (delete / substitute): identical to your `step`
+    to_delete = falses(n)
+    sub_to    = zeros(Int, n)   # 0 => no substitution; otherwise token id
+    for i in 1:n
+        r_del = del[i]
+        r_sub_total = sum(@view sub[:, i])
+        r_tot = r_del + r_sub_total
+        if r_tot > 0 && rand(rng) < (1 - exp(-dt * r_tot))
+            u = rand(rng) * r_tot
+            if u < r_del
+                to_delete[i] = true
+            else
+                u2 = u - r_del
+                acc = 0.0
+                chosen = 0
+                @inbounds for tok in 1:K
+                    acc += sub[tok, i]
+                    if u2 <= acc; chosen = tok; break; end
                 end
+                chosen == 0 && (chosen = findfirst(!=(x[i]), 1:K) |> something(1))
+                sub_to[i] = chosen
             end
-            del[i] = p.μ / max(eps(T), (1 - B.s2))  # μ/(1-s2)
         end
     end
-    # per-gap insertions  (FIXED: include (L+1) transient multiplicity)
+
+    # ── Gap insertions: propose under aligned guide; pseudo-marginal accept
+    # Build right-branch constants once at left edge of the step (no DP tables)
+    T = promote_type(Float64, eltype(sub), eltype(del), eltype(ins))
+    C = make_precomp(P, T(s1))
+    B = make_branch_ud(P, C)
+
+    ins_tok = fill(0, n + 1)
     for s in 0:n
-        q = obl.gap_queues[s+1]
-        L = length(q)
-        # Transient branch: an extra insert can be deleted in any of (L+1) slots along the fixed path
-        base = B.q_ins * (1 - B.s2) * (L + 1)
+        r_ins_total = sum(@view ins[:, s + 1])
+        if r_ins_total > 0 && rand(rng) < (1 - exp(-dt * r_ins_total))
+            # propose token c ∝ ins[:, s+1]
+            u = rand(rng) * r_ins_total
+            acc = 0.0
+            chosen = 0
+            @inbounds for tok in 1:K
+                acc += ins[tok, s + 1]
+                if u <= acc; chosen = tok; break; end
+            end
+            chosen == 0 && (chosen = 1)
 
-        if L == 0
-            @inbounds for c in 1:K
-                ins[c, s+1] = base
-            end
-        else
-            # Productive branch: inserting c can fulfill ANY of the L pending survivors in this gap.
-            # Replacing one Iins factor by s2*P(c->r) for r in q, summed over all r.
-            cnt = zeros(Int, K)
-            @inbounds for r in q
-                cnt[r] += 1
-            end
-            factor = p.μ * B.s2 / max(eps(T), (1 - B.s2))  # μ s2 / (1 - s2)
-            @inbounds for c in 1:K
-                # sum_{r in q} P(c->r) = cnt[c]*Pdiag + (L - cnt[c])*Poff
-                sumP = cnt[c] * B.Pdiag + (L - cnt[c]) * B.Poff
-                ins[c, s+1] = base + factor * sumP
+            # pseudo-marginal acceptance with coupled randomness to reduce variance
+            seed = rand(rng, UInt)
+            rng0 = Random.MersenneTwister(seed)
+            rng1 = Random.MersenneTwister(seed)
+
+            h0_hat = _h_estimate_is(x, x1_vec, B; N=N_is, rng=rng0)
+            h1_hat = _h_insert_estimate_is(x, s, chosen, x1_vec, B; N=N_is, rng=rng1)
+
+            r_true_hat = (P.λ / P.k) * (h1_hat / h0_hat)
+            r_prop     = ins[chosen, s + 1]
+            α = r_prop > 0 ? min(1.0, float(r_true_hat / r_prop)) : 0.0
+
+            if rand(rng) < α
+                ins_tok[s + 1] = chosen
             end
         end
     end
-    return (sub=sub, del=del, ins=ins)
-end
 
-"""
-    doob_conditional_sampled(p, rng, Xt, x1, t)
-
-Sample an alignment, build obligations, and return alignment-conditioned hazards.
-Returns (rates, obligations, hA), where rates=(sub,del,ins) and hA is the alignment mass.
-"""
-function doob_conditional_sampled(p::UDParams{T}, rng::AbstractRNG,
-                                  Xt::Vector{Int}, x1::Vector{Int}, t::T) where {T}
-    B = branchconst(p, t)
-    obl, logh = sample_alignment_and_obligations(rng, Xt, x1, B)
-    rates = doob_conditional_given_alignment(p, Xt, x1, t, obl)
-    return rates, obl, exp(logh)
-end
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Validation: average over alignments vs. marginal hazards
-# ─────────────────────────────────────────────────────────────────────────────
-
-"""
-    validate_conditional_vs_marginal(p, Xt, x1, t; N=50_000, seed=42)
-
-Monte Carlo check: sample N alignments, average conditional hazards,
-compare to full marginal hazards. Returns a NamedTuple with:
-- diffs: (sub_max, del_max, ins_max) maximum absolute errors
-- rel:   (sub_relL2, del_relL2, ins_relL2) relative L2 errors
-- marginal: (sub, del, ins)
-- montecarlo: (sub̄, del̄, ins̄)
-"""
-function validate_conditional_vs_marginal(p::UDParams{T},
-                                          Xt::Vector{Int}, x1::Vector{Int},
-                                          t::T; N::Int=50_000, seed=42) where {T}
-    rng = MersenneTwister(seed)
-    K, n = p.k, length(Xt)
-
-    acc_sub = zeros(T, K, n)
-    acc_del = zeros(T, n)
-    acc_ins = zeros(T, K, n+1)
-
-    for _ in 1:N
-        rates, _, _ = doob_conditional_sampled(p, rng, Xt, x1, t)
-        @inbounds acc_sub .+= rates.sub
-        @inbounds acc_del .+= rates.del
-        @inbounds acc_ins .+= rates.ins
+    # ── Build new sequence (same as your `step`)
+    result = Int[]
+    if ins_tok[1] != 0; push!(result, ins_tok[1]); end
+    for i in 1:n
+        if !to_delete[i]
+            a = sub_to[i] == 0 ? x[i] : sub_to[i]
+            push!(result, a)
+        end
+        if ins_tok[i + 1] != 0
+            push!(result, ins_tok[i + 1])
+        end
     end
-    sub̄ = acc_sub ./ N
-    del̄ = acc_del ./ N
-    ins̄ = acc_ins ./ N
-
-    marg = doob_full_marginal(p, Xt, x1, t)
-
-    # errors
-    sub_max = maximum(abs.(sub̄ .- marg.sub))
-    del_max = maximum(abs.(del̄ .- marg.del))
-    ins_max = maximum(abs.(ins̄ .- marg.ins))
-
-    # relative L2 (guard tiny norms)
-    function relL2(A, B)
-        nA = sqrt(sum(abs2, A)); nB = sqrt(sum(abs2, B))
-        denom = max(nB, eps(T))
-        sqrt(sum(abs2, A .- B)) / denom
-    end
-    sub_rel = relL2(sub̄, marg.sub)
-    del_rel = relL2(del̄, marg.del)
-    ins_rel = relL2(ins̄, marg.ins)
-
-    return (diffs = (sub_max=sub_max, del_max=del_max, ins_max=ins_max),
-            rel   = (sub_relL2=sub_rel, del_relL2=del_rel, ins_relL2=ins_rel),
-            marginal = (sub=marg.sub, del=marg.del, ins=marg.ins),
-            montecarlo = (sub=sub̄, del=del̄, ins=ins̄))
+    return DiscreteState(Xt.K, result)
 end
-
-#=
-p = UDParams(0.3, 0.3, 0.5, 6)
-Xt = [1,6]              # current sequence at time t
-x1 = [1,2,4,6]            # leaf
-t  = 0.35               # in [0,1)
-
-res = validate_conditional_vs_marginal(p, Xt, x1, t; N=10_000_000, seed=7);
-
-res.marginal.ins
-res.montecarlo.ins
-
-res.marginal.del
-res.montecarlo.del
-
-res.marginal.sub
-res.montecarlo.sub
-
-res.marginal.ins .- res.montecarlo.ins
-res.marginal.del .- res.montecarlo.del
-res.marginal.sub .- res.montecarlo.sub
-=#
-=#

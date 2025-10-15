@@ -1049,29 +1049,133 @@ function bridge(p::UniformDiscretePoissonIndelProcess, x0::DiscreteState{<:Abstr
 end
 
 
+# # ─────────────────────────────────────────────────────────────────────────────
+# # PIP Doob-matching loss (positive Bregman on rates)
+# # Needs more thought
+# # ─────────────────────────────────────────────────────────────────────────────
+# function _pos_breg(p::AbstractArray{T}, q::AbstractArray{T}; eps = T(1e-8)) where {T}
+#   return p .* (log.(p .+ eps) .- log.(q .+ eps)) .- p .+ q
+# end
+
 # ─────────────────────────────────────────────────────────────────────────────
-# PIP Doob-matching loss (positive Bregman on rates)
-# Needs more thought
+# Bregman losses on nonnegative rates (per-entry, elementwise).
+# p = teacher/target rates, q = model rates
+# Return same shape as inputs; reduce with scaledmaskedmean(...).
 # ─────────────────────────────────────────────────────────────────────────────
-function _pos_breg(p::AbstractArray{T}, q::AbstractArray{T}; eps = T(1e-8)) where {T}
-  return p .* (log.(p .+ eps) .- log.(q .+ eps)) .- p .+ q
+
+# (A) Generalized KL / Poisson deviance (you already have as `_pos_breg`)
+@inline function _pos_breg_gkl(p::AbstractArray{T}, q::AbstractArray{T}; eps::T=T(1e-8)) where {T}
+  p̃ = max.(p, eps);  q̃ = max.(q, eps)
+  return p̃ .* (log.(p̃) .- log.(q̃)) .- p̃ .+ q̃
 end
 
-#Xt must be a MaskedState with the prefix token
-function floss(P::fbu(UniformDiscretePoissonIndelProcess), Xt::MaskedState{<:DiscreteState}, X̂₁, G::Guide, c)
+# (B) Quadratic (MSE): φ(r)=½‖r‖² ⇒ Dφ(p,q)=½‖p−q‖²
+@inline function _pos_breg_mse(p::AbstractArray{T}, q::AbstractArray{T}) where {T}
+  return T(0.5) .* (p .- q).^2
+end
+
+# (C) Reverse generalized KL: D_rev(p,q) = D_gKL(q || p)
+@inline function _pos_breg_revkl(p::AbstractArray{T}, q::AbstractArray{T}; eps::T=T(1e-8)) where {T}
+  p̃ = max.(p, eps);  q̃ = max.(q, eps)
+  return q̃ .* (log.(q̃) .- log.(p̃)) .- q̃ .+ p̃
+end
+
+# (D) Itakura–Saito (scale-invariant): φ(r)=−∑ log r
+@inline function _pos_breg_is(p::AbstractArray{T}, q::AbstractArray{T}; eps::T=T(1e-8)) where {T}
+  p̃ = max.(p, eps);  q̃ = max.(q, eps)
+  return (p̃ ./ q̃) .- log.(p̃ ./ q̃) .- one(T)
+end
+
+# (E) β-divergence family (unifies MSE, gKL, IS)
+# Limits: β→2 ⇒ MSE, β→1 ⇒ gKL, β→0 ⇒ IS
+@inline function _pos_breg_beta(p::AbstractArray{T}, q::AbstractArray{T}, β::Real; eps::T=T(1e-8)) where {T}
+  if abs(β - 2) < 1e-12
+      return _pos_breg_mse(p, q)
+  elseif abs(β - 1) < 1e-12
+      return _pos_breg_gkl(p, q; eps=eps)
+  elseif abs(β) < 1e-12
+      return _pos_breg_is(p, q; eps=eps)
+  else
+      p̃ = max.(p, eps);  q̃ = max.(q, eps)
+      βT  = T(β)
+      c   = one(T) / (βT * (βT - one(T)))
+      return c .* (p̃ .^ βT .+ (βT - one(T)) .* (q̃ .^ βT) .- βT .* (p̃ .* (q̃ .^ (βT - one(T)))))
+  end
+end
+
+# (F) Weighted/Mahalanobis MSE: φ(r)=½ rᵀW r ⇒ Dφ=½ (p−q)ᵀW(p−q)
+# Pass per-entry weights w ≥ 0 (diagonal W). Note: strictly a Bregman if w is fixed.
+@inline function _pos_breg_wmse(p::AbstractArray{T}, q::AbstractArray{T}, w::AbstractArray{T}) where {T}
+  return T(0.5) .* w .* (p .- q).^2
+end
+
+# (G) Pseudo-Huber Bregman (smooth robust)
+# φ_δ(x)=δ²( √(1+(x/δ)²) − 1 ),  ∇φ_δ(s)= s / √(1+(s/δ)²)
+@inline function _pos_breg_phuber(p::AbstractArray{T}, q::AbstractArray{T}; delta::T=T(1.0), eps::T=T(1e-12)) where {T}
+  δ  = max(delta, eps)
+  invδ = one(T) / δ
+  s_p = sqrt.(one(T) .+ (p .* invδ).^2)
+  s_q = sqrt.(one(T) .+ (q .* invδ).^2)
+  ϕp  = (δ*δ) .* (s_p .- one(T))
+  ϕq  = (δ*δ) .* (s_q .- one(T))
+  gradϕq = q ./ s_q
+  return ϕp .- ϕq .- gradϕq .* (p .- q)
+end
+
+# Choose the Bregman at call-time (dtype-safe: casts eps/delta to eltype(p) on use)
+@inline function select_breg(; kind::Symbol=:beta, β::Real=1.0, eps=1e-8, delta=0.1)
+  if kind === :gkl
+    return (p,q) -> _pos_breg_gkl(p, q; eps = convert(eltype(p), eps))
+  elseif kind === :mse
+    return _pos_breg_mse
+  elseif kind === :is
+    return (p,q) -> _pos_breg_is(p, q; eps = convert(eltype(p), eps))
+  elseif kind === :revkl
+    return (p,q) -> _pos_breg_revkl(p, q; eps = convert(eltype(p), eps))
+  elseif kind === :beta
+    return (p,q) -> _pos_breg_beta(p, q, β; eps = convert(eltype(p), eps))
+  elseif kind === :phuber
+    return (p,q) -> _pos_breg_phuber(p, q; delta = convert(eltype(p), delta),
+                                         eps   = convert(eltype(p), eps))
+  else
+    error("Unknown loss kind: $kind")
+  end
+end
+
+# Example usage in your floss:
+function floss(P::fbu(UniformDiscretePoissonIndelProcess), Xt::MaskedState{<:DiscreteState}, X̂₁, G::Guide, c;
+             loss_kind::Symbol=:beta, β::Real=1.0, eps=1e-8, delta=0.1)
+
   sub_rates = P.transform(X̂₁.sub)
   del_rates = P.transform(X̂₁.del)
   ins_rates = P.transform(X̂₁.ins)
-  # Zero self-substitutions using current tokens in Xt
-  #Ick. This is because of the mismatch between the model's "K" and the process's "k", where "batch" gives elements in the range of the former for padded tokens
-  ohXt = tensor(onehotbatch(clamp.(tensor(Xt)[2:end,:], 1, P.k), 1:P.k)) 
+
+  ohXt = tensor(onehotbatch(clamp.(tensor(Xt)[2:end,:], 1, P.k), 1:P.k))
   sub_rates = sub_rates .* (1 .- ohXt)
-  # Positive Bregman D(tgt || pred)
-  loss = scaledmaskedmean(_pos_breg(G.H.sub, sub_rates), c, getlmask(G)) +
-         scaledmaskedmean(_pos_breg(G.H.del, del_rates), c, getlmask(G)) +
-         scaledmaskedmean(_pos_breg(G.H.ins, ins_rates), c, getlmask(Xt)) #Use the Xt mask, which has a prefix, for the subs!
-  return loss
+
+  breg = select_breg(; kind=loss_kind, β=β, eps=eps, delta=delta)
+
+  return  scaledmaskedmean(breg(G.H.sub, sub_rates), c, getlmask(G)) +
+          scaledmaskedmean(breg(G.H.del, del_rates), c, getlmask(G)) +
+          scaledmaskedmean(breg(G.H.ins, ins_rates), c, getlmask(Xt))
 end
+
+
+# #Xt must be a MaskedState with the prefix token
+# function floss(P::fbu(UniformDiscretePoissonIndelProcess), Xt::MaskedState{<:DiscreteState}, X̂₁, G::Guide, c; loss = _pos_breg)
+#   sub_rates = P.transform(X̂₁.sub)
+#   del_rates = P.transform(X̂₁.del)
+#   ins_rates = P.transform(X̂₁.ins)
+#   # Zero self-substitutions using current tokens in Xt
+#   #Ick. This is because of the mismatch between the model's "K" and the process's "k", where "batch" gives elements in the range of the former for padded tokens
+#   ohXt = tensor(onehotbatch(clamp.(tensor(Xt)[2:end,:], 1, P.k), 1:P.k)) 
+#   sub_rates = sub_rates .* (1 .- ohXt)
+#   # Positive Bregman D(tgt || pred)
+#   loss_val = scaledmaskedmean(loss(G.H.sub, sub_rates), c, getlmask(G)) +
+#              scaledmaskedmean(loss(G.H.del, del_rates), c, getlmask(G)) +
+#              scaledmaskedmean(loss(G.H.ins, ins_rates), c, getlmask(Xt)) #Use the Xt mask, which has a prefix, for the subs!
+#   return loss_val
+# end
 
 #=
 _like(like, ::Type{T}, dims...) where {T} = similar(like, T, dims...)
@@ -1339,6 +1443,65 @@ function GuideAligned(P::UniformDiscretePoissonIndelProcess{T}, t::Real,
     events, _ = sample_alignment_branch_ud(rng, Xt_vec, x1_vec, B)
     rates = doob_ud_full_tensors_aligned(P, Xt_vec, x1_vec, T(t), events)
     return Flowfusion.Guide((sub = rates.sub, del = rates.del, ins = rates.ins))
+end
+
+function GuideAligned2(P::UniformDiscretePoissonIndelProcess{T}, t::Real,
+  Xt::DiscreteState{<:AbstractArray{<:Signed}},
+  X1::DiscreteState{<:AbstractArray{<:Signed}};
+  rng::AbstractRNG = Random.default_rng()) where {T}
+
+  C = make_precomp(P, T(t))
+  B = make_branch_ud(P, C)
+  Xt_vec = collect(tensor(Xt))
+  x1_vec = collect(tensor(X1))
+
+  events, _ = sample_alignment_branch_ud(rng, Xt_vec, x1_vec, B)
+  rates = doob_ud_full_tensors_aligned(P, Xt_vec, x1_vec, T(t), events)
+  return Flowfusion.Guide((sub = rates.sub, del = rates.del, ins = rates.ins)), events
+end
+
+
+
+function GuideAligned2(P::UniformDiscretePoissonIndelProcess{T},
+  tvec::AbstractVector{<:Real},
+  Xts::Vector{<:DiscreteState{<:AbstractArray{<:Signed}}},
+  X1s::Vector{<:DiscreteState{<:AbstractArray{<:Signed}}};
+  rng::AbstractRNG = Random.default_rng()) where {T}
+
+    Bsz = length(Xts)
+    @assert Bsz == length(X1s) == length(tvec)
+    lens  = length.(tensor.(Xts))
+    nmax  = maximum(lens)
+    K     = P.k
+    S     = eltype(tvec)
+
+    events_vec = Vector{Vector{Event}}()
+    sub    = zeros(S, K, nmax, Bsz)
+    del    = zeros(S, 1, nmax, Bsz)
+    ins    = zeros(S, K, nmax + 1, Bsz)
+    lmask  = falses(nmax, Bsz)
+    gapmask= falses(nmax + 1, Bsz)
+
+
+    for b in 1:Bsz
+      t = T(tvec[b])
+      Xt = Xts[b]; X1 = X1s[b]
+      C  = make_precomp(P, t)
+      B  = make_branch_ud(P, C)
+      Xt_vec = collect(tensor(Xt))
+      x1_vec = collect(tensor(X1))
+      events, _ = sample_alignment_branch_ud(rng, Xt_vec, x1_vec, B)
+      push!(events_vec, events)
+      rates = doob_ud_full_tensors_aligned(P, Xt_vec, x1_vec, t, events)
+      n = length(Xt_vec)
+      sub[:, 1:n, b]     .= S.(rates.sub)
+      del[1, 1:n, b]     .= S.(rates.del)
+      ins[:, 1:(n+1), b] .= S.(rates.ins)
+      lmask[1:n, b]      .= true
+      gapmask[1:n+1, b]  .= true
+    end
+
+    return Flowfusion.Guide((sub = sub, del = del, ins = ins), gapmask, lmask), events_vec
 end
 
 

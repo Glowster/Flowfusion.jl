@@ -29,6 +29,7 @@ include("processes.jl")
 include("doob.jl")
 include("batching.jl")
 include("poissonindelprocess.jl")
+include("editflows.jl")
 
 export
     #Processes not in ForwardBackward.jl
@@ -36,6 +37,7 @@ export
     NoisyInterpolatingDiscreteFlow,
     DoobMatchingFlow,
     UniformDiscretePoissonIndelProcess,
+    EditFlow,
     MaskedState,
     Guide,
     tangent_guide,

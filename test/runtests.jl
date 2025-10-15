@@ -2,6 +2,7 @@ using Flowfusion
 using Test
 using Manifolds
 using ForwardBackward
+include("test_editflows.jl")
 
 @testset "Flowfusion.jl" begin
 

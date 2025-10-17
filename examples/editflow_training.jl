@@ -1,5 +1,7 @@
 # Sketch: training loop for EditFlow (mirrors PIP loop structure)
-
+using Pkg
+Pkg.activate(@__DIR__)
+using Revise
 using Random
 using Statistics
 using Adapt
@@ -31,12 +33,19 @@ Placeholder minibatch maker: return
 - ts: Vector{Float32} in [0,1].
 Replace with your dataset pipeline.
 """
-function make_minibatch(B::Int; K::Int, rng=Random.default_rng())
-    x0s = [FF.DiscreteState(K, Int[]) for _ in 1:B]
+function make_minibatch(B::Int, P::FF.EditFlow; rng=Random.default_rng())
+    K = P.k
+    pad = P.padding_token
+    bos = P.bos_token
+    toks = collect(setdiff(1:K, (pad,)))
+    x0s = Vector{FF.DiscreteState}(undef, B)
     x1s = Vector{FF.DiscreteState}(undef, B)
     for b in 1:B
-        len = rand(rng, 3:8)
-        x1s[b] = FF.DiscreteState(K, rand(rng, 1:K, len))
+        true_len = rand(rng, 4:8)
+        real_tokens = rand(rng, toks, true_len) # exclude padding token
+        seq = vcat(real_tokens, fill(pad, 8 - true_len))
+        x1s[b] = FF.DiscreteState(K, seq)
+        x0s[b] = FF.DiscreteState(K, [bos])
     end
     ts = rand(rng, Float32, B)
     return x0s, x1s, ts
@@ -56,17 +65,24 @@ function latent_bridge_matrices(P::FF.EditFlow,
     # Pad X1s to matrix (LxB)
     X1_ms = FF.batch(X1s)
     Z1 = FF.tensor(X1_ms)
-    # Construct Z0
+    # Prepend BOS row to Z1
+    Z1 = vcat(fill(P.bos_token, 1, size(Z1, 2)), Z1)
+    # Construct Z0 (respect BOS row)
     Z0 = similar(Z1)
     @inbounds for j in axes(Z1, 2), i in axes(Z1, 1)
         tok = Z1[i, j]
-        Z0[i, j] = (tok == P.padding_token) ? tok : P.latent_token
+        if i == 1
+            Z0[i, j] = tok # keep BOS as is
+        else
+            Z0[i, j] = (tok == P.padding_token) ? tok : P.latent_token
+        end
     end
     # Mix via κ(t)
     Zt = similar(Z1)
     @inbounds for j in axes(Z1, 2), i in axes(Z1, 1)
         keep = rand() < clamp(P.κ(ts[j]), 0, 1)
-        Zt[i, j] = keep ? Z1[i, j] : Z0[i, j]
+        # If i==1 (BOS row), always keep BOS from Z1
+        Zt[i, j] = (i == 1) ? Z1[i, j] : (keep ? Z1[i, j] : Z0[i, j])
     end
     return Z0, Z1, Zt
 end
@@ -96,31 +112,31 @@ function train_editflow!(P::FF.EditFlow,
     for epoch in 1:epochs
         for step in 1:steps_per_epoch
             # 1) Minibatch
-            x0s, x1s, ts = make_minibatch(batch_size; K=P.k, rng=rng)
+            x0s, x1s, ts = make_minibatch(batch_size, P; rng=rng)
 
             # 2) Latent bridge (Z0/Z1/Zt), Xt padded, masks and multipliers
             Z0, Z1, Zt = latent_bridge_matrices(P, x1s, ts)
             Xt = FF.remove_and_pad_concise(Zt, P.latent_token, P.padding_token)
-            transition_mask = FF.transition_mask_from_Xt(P, Xt)
-            edit_multiplier = FF.remaining_edits_dense(P, Zt, Z1)
+            lmask = FF.transition_mask_from_Xt(P, Xt)
+            edit_multiplier = FF.remaining_edits(P, Zt, Z1)
             scheduler_scaling = dk.(ts) ./ (1 .- k.(ts))  # (B,)
 
             # 3) Build Xt MaskedState with lmask from padding
-            lmask = Xt .!= P.padding_token
+            #lmask = Xt .!= P.padding_token
             cmask = trues(size(lmask))
             Xt_ms = FF.MaskedState(FF.DiscreteState(P.k, Xt), cmask, lmask)
-
+            
             # 4) Device
             ts_d    = to_dev(ts)
             Xt_ms_d = to_dev(Xt_ms)
-            T_d     = to_dev(transition_mask)
+            L_d     = to_dev(lmask)
             E_d     = to_dev(edit_multiplier)
             scl_d   = to_dev(reshape(Float32.(scheduler_scaling), 1, 1, :))
 
             # 5) Forward + loss + update
             loss, grad = Flux.withgradient(model) do m
                 M = m(ts_d, Xt_ms_d)                  # (2K+1, L, B)
-                FF.edit_loss(P, M, T_d, E_d, scl_d)
+                FF.edit_loss(P, M, L_d, E_d, scl_d)
             end
             Flux.update!(opt_state, model, grad[1])
 
@@ -144,13 +160,11 @@ function (m::EditFlowDummyModel)(ts, Xt_ms)
     return abs.(randn(Float32, 2*m.K + 1, L, B)) .+ 1f-3
 end
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    # Quick smoke run
-    K = 8
-    P = FF.EditFlow(K)
-    model = EditFlowDummyModel(K)
-    train_editflow!(P, model; epochs=1, steps_per_epoch=5, batch_size=16, lr=1f-3)
-end
+# Quick smoke run
+K = 8
+P = FF.EditFlow(K)
+model = EditFlowDummyModel(K)
+train_editflow!(P, model; epochs=1, steps_per_epoch=5, batch_size=16, lr=1f-3)
 
 
 

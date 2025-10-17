@@ -28,11 +28,13 @@ end
 
 EditFlow(k; transform = NNlib.softplus,
             κ = identity,
-            padding_token::Int = k,
-            latent_token::Int = k + 1,
+            padding_token::Int = k + 1,
+            latent_token::Int = k + 2,
             bos_token::Int = 0) =
     EditFlow(k, transform, κ, padding_token, latent_token, bos_token)
 
+
+#=
 """
     step(P::EditFlow, Xt::DiscreteState, hat, s1, s2)
 
@@ -179,6 +181,111 @@ function step(P::EditFlow,
 
     return DiscreteState(Xt.K, result)
 end
+=#
+
+@inline function pick_index(w::AbstractVector{<:Real})::Int
+    # treat negatives as zero; assert we have some mass
+    cs = cumsum(max.(w, zero(eltype(w))))
+    s  = cs[end]
+    @assert isfinite(s) && s > 0 "pick_index: all weights ≤ 0 or non-finite"
+    u = rand() * s
+    return searchsortedfirst(cs, u)  # 1..length(w)
+end
+
+function step(P::EditFlow,
+              Xt::DiscreteState{<:AbstractArray{<:Signed}},
+              hat,
+              s1::Real, s2::Real)
+
+    @assert ndims(Xt.state) == 1 "EditFlow.step only supports 1D DiscreteState"
+
+    # Rates
+    pins, psub, pdel = part_output(P, P.transform(hat))   # (K,n+1,B), (K,n,B), (1,n,B)
+    ins = Array(pins[:, :, 1])                            # (K, n+1) or (K, n)
+    sub = Array(psub[:, :, 1]) 
+    del = vec(Array(pdel[1, :, 1]))                       # (n,)  <-- fixed
+
+    K, n = size(sub, 1), size(sub, 2)
+    @assert size(ins, 1) == K
+    @assert length(del) == n
+
+    # Ensure gaps shape (K, n+1)
+    ins_gaps = if size(ins, 2) == n + 1
+        ins
+    elseif size(ins, 2) == n
+        tmp = similar(ins, K, n + 1)
+        @inbounds for s in 0:n
+            pos = clamp(s, 1, n)
+            @views tmp[:, s + 1] .= ins[:, pos]
+        end
+        tmp
+    else
+        error("EditFlow.step: bad ins size $(size(ins))")
+    end
+
+    dt = float(s2 - s1)
+    x = collect(tensor(Xt))  # Vector{Int}
+
+    # Forbid self-substitutions
+    if n > 0
+        current_mask = zeros(eltype(sub), size(sub))
+        @inbounds for i in 1:n
+            tok = x[i]
+            if 1 ≤ tok ≤ K
+                current_mask[tok, i] = 1
+            end
+        end
+        sub .*= (1 .- current_mask)
+    end
+
+    # Optionally forbid editing BOS explicitly
+    if n > 0 && x[1] == P.bos_token
+        sub[:, 1] .= 0
+        del[1] = 0
+    end
+
+    # ---- site events (delete/sub) ----
+    to_delete = falses(n)
+    sub_to    = zeros(Int, n)
+    @inbounds for i in 1:n
+        r_del = del[i]
+        r_sub_total = sum(@view sub[:, i])
+        r_tot = r_del + r_sub_total
+        if r_tot > 0 && rand() < (1 - exp(-dt * r_tot))
+            u = rand() * r_tot
+            if u < r_del
+                to_delete[i] = true
+            elseif r_sub_total > 0
+                sub_to[i] = pick_index(@view sub[:, i])
+            end
+        end
+    end
+
+    # ---- gap insertions (≤1 per gap) ----
+    ins_tok = fill(0, n + 1)
+    start_gap = (n > 0 && x[1] == P.bos_token) ? 1 : 0
+    @inbounds for s in start_gap:n
+        r_ins_total = sum(@view ins_gaps[:, s + 1])
+        #println("r_ins_total", ins_gaps[:, s + 1])
+        if r_ins_total > 0 && rand() < (1 - exp(-dt * r_ins_total))
+            ins_tok[s + 1] = pick_index(@view ins_gaps[:, s + 1])
+        end
+    end
+
+    # ---- build new sequence ----
+    result = Int[]
+    if ins_tok[1] != 0; push!(result, ins_tok[1]); end
+    @inbounds for i in 1:n
+        if !to_delete[i]
+            a = (sub_to[i] == 0) ? x[i] : sub_to[i]
+            push!(result, a)
+        end
+        if ins_tok[i + 1] != 0
+            push!(result, ins_tok[i + 1])
+        end
+    end
+    return DiscreteState(Xt.K, result)
+end
 
 """
     bridge(P::EditFlow, X0::DiscreteState, X1::DiscreteState, t)
@@ -286,7 +393,7 @@ function part_output(P::EditFlow, M::AbstractArray)
     K = P.k
     ins = M[1:K,:,:]
     sub = M[K+1:2K,:,:]
-    del = M[2K+1,:,:]
+    del = M[2K+1:2K+1,:,:]
     return ins, sub, del
 end
 
@@ -317,6 +424,27 @@ Shapes:
 - scheduler_scaling: (1, B) or (B,) broadcastable to (1,1,B)
 """
 function edit_loss(P::EditFlow,
+                   M, transition_mask, edit_multiplier, scheduler_scaling;
+                   op_mask=nothing, eps=1e-8)
+
+    R = P.transform(M)                              # must be >= 0
+    # (A) Optional op mask to apply symmetrically
+    OM = isnothing(op_mask) ? one(eltype(R)) : op_mask
+
+    # (B) Sum of valid outgoing rates
+    term1 = sum(transition_mask .* (OM .* R); dims=(1,2))
+
+    # (C) Logs only of positive rates (avoid NaN/Inf)
+    R_logsafe = max.(R, eltype(R)(eps))             # clamp BEFORE log
+    logR = log.(R_logsafe)
+
+    scl = reshape(scheduler_scaling, 1, 1, :)       # (1,1,B)
+    term2 = sum(scl .* (edit_multiplier .* OM) .* logR; dims=(1,2))
+
+    return mean(term1 .- term2)
+end
+#=
+function edit_loss(P::EditFlow,
                    M::AbstractArray,
                    transition_mask::AbstractArray,
                    edit_multiplier::AbstractArray,
@@ -331,7 +459,7 @@ function edit_loss(P::EditFlow,
     term2 = sum(scl .* edit_multiplier .* log.(R .+ epsT); dims=(1,2))
     return mean(term1 .- term2)
 end
-
+=#
 """
     combine_rates(P::EditFlow, G::Guide) -> M
 
@@ -367,18 +495,18 @@ end
 Convenience wrapper: accepts either combined `X̂₁` of shape (2K+1,n[,B]) or a Guide payload,
 and computes `edit_loss` with provided masks and scaling.
 """
-function floss(P::EditFlow,
-               Xt::MaskedState{<:DiscreteState},
-               X̂₁,
-               G::Guide,
-               scheduler_scaling,
-               transition_mask,
-               edit_multiplier;
-               op_mask=nothing,
-               eps=1e-8)
-    M = X̂₁ isa AbstractArray ? X̂₁ : combine_rates(P, Flowfusion.Guide(X̂₁))
-    return edit_loss(P, M, transition_mask, edit_multiplier, scheduler_scaling; op_mask=op_mask, eps=eps)
-end
+# function floss(P::EditFlow,
+#                Xt::MaskedState{<:DiscreteState},
+#                X̂₁,
+#                G::Guide,
+#                scheduler_scaling,
+#                transition_mask,
+#                edit_multiplier;
+#                op_mask=nothing,
+#                eps=1e-8)
+#     M = X̂₁ isa AbstractArray ? X̂₁ : combine_rates(P, Flowfusion.Guide(X̂₁))
+#     return edit_loss(P, M, transition_mask, edit_multiplier, scheduler_scaling; op_mask=op_mask, eps=eps)
+# end
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Remaining-edits and masks (from reference training loop), batched
@@ -445,6 +573,8 @@ Row mapping: 1..K insertions, K+1..2K substitutions to that token, 2K+1 deletion
 
 #     return E
 # end
+
+#= My implementation of remaining_edits_dense
 function remaining_edits(P::EditFlow, Zt::AbstractMatrix{Int}, Z1::AbstractMatrix{Int}; dense=false)
     latent_token = P.latent_token
     padding_token = P.padding_token
@@ -454,6 +584,7 @@ function remaining_edits(P::EditFlow, Zt::AbstractMatrix{Int}, Z1::AbstractMatri
 
     filtered_cols = [filter(x -> x != latent_token, col) for col in eachcol(Zt)]
     batch_length = maximum(length, filtered_cols) 
+    
     pos = cumsum((Zt .!= padding_token) .& (Zt .!= latent_token), dims=1)
     #Insert 
     inserts = Z1.*(Zt .== latent_token)
@@ -499,6 +630,121 @@ function remaining_edits(P::EditFlow, Zt::AbstractMatrix{Int}, Z1::AbstractMatri
         return vcat(insert_edits, sub_edits, del_edits)
     end
 
+end
+=#
+
+
+#=
+function remaining_edits(P::EditFlow, Zt::AbstractMatrix{Int}, Z1::AbstractMatrix{Int}; dense=false)
+    latent_token   = P.latent_token
+    padding_token  = P.padding_token
+    tokens         = P.k
+    (_, batch_size) = size(Z1)
+
+    # Xt length = max over columns after removing latent
+    filtered_cols = [filter(x -> x != latent_token, col) for col in eachcol(Zt)]
+    batch_length  = maximum(length, filtered_cols)
+
+    # Position indices within Xt (count non-(latent|padding))
+    pos = cumsum((Zt .!= padding_token) .& (Zt .!= latent_token), dims=1)
+
+    # -------------------- Inserts: Zt==latent, Z1 in 1..K --------------------
+    insert_mask = (Zt .== latent_token) .& (Z1 .>= 1) .& (Z1 .<= tokens)
+    insert_edits = zeros(Float32, (tokens, batch_length, batch_size))
+    insert_indices = findall(insert_mask)
+    insert_cols_to_update = clamp.(pos[insert_mask], 1, batch_length)
+    insert_rows_to_update = Z1[insert_mask]                     # 1..K
+    insert_samples_to_update = [idx[2] for idx in insert_indices]
+    @inbounds for i in 1:length(insert_rows_to_update)
+        insert_edits[insert_rows_to_update[i], insert_cols_to_update[i], insert_samples_to_update[i]] += 1
+    end
+    dense_inserts = (insert_rows_to_update, insert_cols_to_update, insert_samples_to_update)
+
+    # ------------- Substitutions: Zt∉{latent,pad}, Z1 in 1..K, Z1≠Zt -------------
+    sub_mask = (Zt .!= latent_token) .& (Zt .!= padding_token) .&
+               (Z1 .>= 1) .& (Z1 .<= tokens) .& (Z1 .!= Zt)
+    sub_edits = zeros(Float32, (tokens, batch_length, batch_size))
+    sub_indices = findall(sub_mask)
+    sub_cols_to_update = clamp.(pos[sub_mask], 1, batch_length)
+    sub_rows_to_update = Z1[sub_mask]                           # 1..K
+    sub_samples_to_update = [idx[2] for idx in sub_indices]
+    @inbounds for i in 1:length(sub_rows_to_update)
+        sub_edits[sub_rows_to_update[i], sub_cols_to_update[i], sub_samples_to_update[i]] = 1
+    end
+    dense_subs = (sub_rows_to_update .+ tokens, sub_cols_to_update, sub_samples_to_update)
+
+    # ------------------------ Deletions: Z1==latent ------------------------
+    dels = (Z1 .== latent_token)
+    del_edits = zeros(Float32, (1, batch_length, batch_size))
+    del_indices = findall(dels)
+    del_cols_to_update = clamp.(pos[dels], 1, batch_length)
+    del_samples_to_update = [idx[2] for idx in del_indices]
+    @inbounds for i in 1:length(del_cols_to_update)
+        del_edits[1, del_cols_to_update[i], del_samples_to_update[i]] = 1
+    end
+    dense_dels = ((2*tokens+1) .* ones(Int, length(del_cols_to_update)), del_cols_to_update, del_samples_to_update)
+
+    return dense ? (dense_inserts, dense_subs, dense_dels) : vcat(insert_edits, sub_edits, del_edits)
+end
+=#
+
+# Safe override for remaining_edits to avoid out-of-bounds row indexing
+# Ensures only 1..P.k token ids are used as row indices and batch length matches pos
+function remaining_edits(P::FF.EditFlow, Zt::AbstractMatrix{Int}, Z1::AbstractMatrix{Int}; dense::Bool=false)
+    @assert size(Zt) == size(Z1)
+    L, B = size(Z1)
+
+    latent_token  = P.latent_token
+    padding_token = P.padding_token
+    tokens        = P.k
+
+    # Position index per (i,j); pos is (L,B)
+    pos = cumsum((Zt .!= padding_token) .& (Zt .!= latent_token), dims=1)
+    batch_length = maximum(vec(pos[end, :]))
+
+    # Inserts: positions where Zt is latent; only valid row ids 1..tokens
+    ins_mask = (Zt .== latent_token) .& (1 .<= Z1 .<= tokens)
+    insert_indices = findall(ins_mask)
+    insert_rows_to_update = Z1[insert_indices]
+    insert_cols_to_update = pos[insert_indices]
+    insert_samples_to_update = ntuple(_ -> 0, 0); insert_samples_to_update = [I[2] for I in insert_indices]
+
+    insert_edits = zeros(Float32, (tokens, batch_length, B))
+    @inbounds for i in 1:length(insert_rows_to_update)
+        insert_edits[insert_rows_to_update[i], insert_cols_to_update[i], insert_samples_to_update[i]] += 1f0
+    end
+    dense_inserts = (insert_rows_to_update, insert_cols_to_update, insert_samples_to_update)
+
+    # Substitutions: valid tokens, different from latent and changed from Zt
+    sub_mask = (Zt .!= latent_token) .& (Z1 .!= latent_token) .& (Z1 .!= Zt) .& (1 .<= Z1 .<= tokens)
+    sub_indices = findall(sub_mask)
+    sub_rows_to_update = Z1[sub_indices]
+    sub_cols_to_update = pos[sub_indices]
+    sub_samples_to_update = ntuple(_ -> 0, 0); sub_samples_to_update = [I[2] for I in sub_indices]
+
+    sub_edits = zeros(Float32, (tokens, batch_length, B))
+    @inbounds for i in 1:length(sub_rows_to_update)
+        sub_edits[sub_rows_to_update[i], sub_cols_to_update[i], sub_samples_to_update[i]] = 1f0
+    end
+    dense_subs = (sub_rows_to_update .+ tokens, sub_cols_to_update, sub_samples_to_update)
+
+    # Deletions: latent in Z1
+    del_mask = (Z1 .== latent_token)
+    del_indices = findall(del_mask)
+    del_cols_to_update = pos[del_indices]
+    del_samples_to_update = ntuple(_ -> 0, 0); del_samples_to_update = [I[2] for I in del_indices]
+
+    del_edits = zeros(Float32, (1, batch_length, B))
+    @inbounds for i in 1:length(del_cols_to_update)
+        del_edits[1, del_cols_to_update[i], del_samples_to_update[i]] = 1f0
+    end
+    dense_dels = ((2*tokens+1).*ones(Int64, length(del_cols_to_update)), del_cols_to_update, del_samples_to_update)
+
+    if dense
+        return (dense_inserts, dense_subs, dense_dels)
+    else
+        return vcat(insert_edits, sub_edits, del_edits)
+    end
 end
 
 

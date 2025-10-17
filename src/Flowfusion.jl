@@ -18,6 +18,7 @@ Later:
 
 
 module Flowfusion
+const FF = Flowfusion
 
 using ForwardBackward, OneHotArrays, Adapt, Manifolds, NNlib, LogExpFunctions, Random, Distributions
 
